@@ -142,12 +142,25 @@ $topicIn  = "campus_xfer/$pairCode/to_host"
 $topicOut = "campus_xfer/$pairCode/to_guest"
 [void]$mqtt.SubscribeAsync($topicIn).GetAwaiter().GetResult()
 
+# 强制终端切换 UTF-8 输出以完美渲染 Unicode 二维码块字符
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
 Clear-Host
 Write-Host "=====================================================" -ForegroundColor Green
-Write-Host "  [READY] Fileless P2P File Receiver Online" -ForegroundColor Green
+Write-Host "  [READY] Fileless P2P Receiver Online" -ForegroundColor Green
 Write-Host "  [PAIR CODE] Enter on phone:  $pairCode" -ForegroundColor Yellow
 Write-Host "  [SAVE PATH] Auto-save to Desktop" -ForegroundColor Cyan
-Write-Host "=====================================================`n" -ForegroundColor Green
+Write-Host "=====================================================" -ForegroundColor Green
+
+# 尝试在终端直接渲染 Unicode 二维码（内容为 XFER:节点号-房间号，与手机拍照识码完全兼容）
+try {
+    $qrAscii = Invoke-RestMethod -Uri "https://qrenco.de/XFER:$pairCode" -UserAgent "curl/7.88.1" -TimeoutSec 2
+    if ($qrAscii) {
+        Write-Host $qrAscii -ForegroundColor White
+    }
+} catch {
+    # 若该接口被防火墙拦截则静默跳过，直接看上方黄色数字配对码即可
+}
 
 $desktopPath = [Environment]::GetFolderPath("Desktop")
 $chunks = @{}
