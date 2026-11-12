@@ -118,35 +118,35 @@ $mqtt = New-Object MiniMqttWss
 $roomId = Get-Random -Minimum 100000 -Maximum 999999
 $connectedIdx = -1
 
-Write-Host "`n[*] 正在探测高可用公共加密通道..." -ForegroundColor Cyan
+Write-Host "`n[*] Probing public WSS relay nodes..." -ForegroundColor Cyan
 for ($i = 0; $i -lt $brokers.Count; $i++) {
     $b = $brokers[$i]
-    Write-Host "    尝试节点 $i [$($b.Name)]..." -NoNewline
+    Write-Host "    Node $i [$($b.Name)]..." -NoNewline
     $ok = $mqtt.ConnectAsync($b.Url, "ps_host_$roomId").GetAwaiter().GetResult()
     if ($ok) {
-        Write-Host " 成功!" -ForegroundColor Green
+        Write-Host " OK!" -ForegroundColor Green
         $connectedIdx = $i
         break
     } else {
-        Write-Host " 超时跳过" -ForegroundColor DarkGray
+        Write-Host " Timeout" -ForegroundColor DarkGray
     }
 }
 
 if ($connectedIdx -eq -1) {
-    Write-Host "[!] 所有公共节点均无法连接，请检查网络。" -ForegroundColor Red
+    Write-Host "[!] All public nodes unreachable. Check internet." -ForegroundColor Red
     return
 }
 
 $pairCode = "$connectedIdx-$roomId"
 $topicIn  = "campus_xfer/$pairCode/to_host"
 $topicOut = "campus_xfer/$pairCode/to_guest"
-$mqtt.SubscribeAsync($topicIn).GetAwaiter().GetResult()
+[void]$mqtt.SubscribeAsync($topicIn).GetAwaiter().GetResult()
 
 Clear-Host
 Write-Host "=====================================================" -ForegroundColor Green
-Write-Host "  🛡️  无文件落地 · 跨网文件接收终端已就绪" -ForegroundColor Green
-Write-Host "  📱 请在手机端输入配对码:  $pairCode" -ForegroundColor Yellow
-Write-Host "  📂 接收文件将自动保存到桌面 (Desktop)" -ForegroundColor Cyan
+Write-Host "  [READY] Fileless P2P File Receiver Online" -ForegroundColor Green
+Write-Host "  [PAIR CODE] Enter on phone:  $pairCode" -ForegroundColor Yellow
+Write-Host "  [SAVE PATH] Auto-save to Desktop" -ForegroundColor Cyan
 Write-Host "=====================================================`n" -ForegroundColor Green
 
 $desktopPath = [Environment]::GetFolderPath("Desktop")
@@ -155,33 +155,33 @@ $fileMeta = $null
 
 while ($true) {
     $jsonStr = $mqtt.ReceivePayloadAsync().GetAwaiter().GetResult()
-    if ($null -eq $jsonStr) { Write-Host "[!] 连接已断开"; break }
+    if ($null -eq $jsonStr) { Write-Host "[!] Disconnected"; break }
     if ($jsonStr -eq "") { continue }
 
     $msg = $jsonStr | ConvertFrom-Json
     if ($msg.type -eq "ping") {
-        $mqtt.PublishAsync($topicOut, '{"type":"pong"}').GetAwaiter().GetResult()
-        Write-Host "[+] 手机已连接！等待发送文件..." -ForegroundColor Green
+        [void]$mqtt.PublishAsync($topicOut, '{"type":"pong"}').GetAwaiter().GetResult()
+        Write-Host "[+] Phone connected! Waiting for files..." -ForegroundColor Green
     }
     elseif ($msg.type -eq "file-meta") {
         $fileMeta = $msg
         $chunks = @{}
-        Write-Host "[↓] 正在接收: $($msg.name) ($([math]::Round($msg.size / 1KB, 1)) KB)..." -ForegroundColor Cyan
+        Write-Host "[RX] Receiving: $($msg.name) ($([math]::Round($msg.size / 1KB, 1)) KB)..." -ForegroundColor Cyan
     }
     elseif ($msg.type -eq "file-chunk") {
         $chunks[$msg.index] = [Convert]::FromBase64String($msg.data)
         $pct = [math]::Round(($chunks.Count / $fileMeta.totalChunks) * 100)
-        Write-Progress -Activity "正在接收 $($fileMeta.name)" -Status "$pct%" -PercentComplete $pct
+        Write-Progress -Activity "Receiving $($fileMeta.name)" -Status "$pct%" -PercentComplete $pct
 
         if ($chunks.Count -eq $fileMeta.totalChunks) {
-            Write-Progress -Activity "正在接收 $($fileMeta.name)" -Completed
+            Write-Progress -Activity "Receiving $($fileMeta.name)" -Completed
             $savePath = Join-Path $desktopPath $fileMeta.name
             $fs = [System.IO.File]::Create($savePath)
             for ($k = 0; $k -lt $fileMeta.totalChunks; $k++) {
                 $fs.Write($chunks[$k], 0, $chunks[$k].Length)
             }
             $fs.Close()
-            Write-Host "[✔] 接收完成！已自动保存至桌面: $savePath" -ForegroundColor Green
+            Write-Host "[OK] Saved to Desktop: $savePath" -ForegroundColor Green
         }
     }
 }
