@@ -1,0 +1,187 @@
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$csharpCode = @"
+using System;
+using System.IO;
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+public class MiniMqttWss {
+    private ClientWebSocket ws = new ClientWebSocket();
+
+    public async Task<bool> ConnectAsync(string url, string clientId) {
+        try {
+            ws.Options.AddSubProtocol("mqtt");
+            var cts = new CancellationTokenSource(4500);
+            await ws.ConnectAsync(new Uri(url), cts.Token);
+
+            byte[] idBytes = Encoding.UTF8.GetBytes(clientId);
+            int remLen = 10 + 2 + idBytes.Length;
+            using (var ms = new MemoryStream()) {
+                ms.WriteByte(0x10);
+                WriteVarInt(ms, remLen);
+                ms.Write(new byte[] { 0x00, 0x04, (byte)'M', (byte)'Q', (byte)'T', (byte)'T', 0x04, 0x02, 0x00, 0x3C }, 0, 10);
+                ms.WriteByte((byte)(idBytes.Length >> 8));
+                ms.WriteByte((byte)(idBytes.Length & 0xFF));
+                ms.Write(idBytes, 0, idBytes.Length);
+                byte[] pkt = ms.ToArray();
+                await ws.SendAsync(new ArraySegment<byte>(pkt), WebSocketMessageType.Binary, true, CancellationToken.None);
+            }
+            byte[] buf = new byte[64];
+            var res = await ws.ReceiveAsync(new ArraySegment<byte>(buf), cts.Token);
+            return res.Count >= 4 && buf[0] == 0x20 && buf[3] == 0x00;
+        } catch { return false; }
+    }
+
+    public async Task SubscribeAsync(string topic) {
+        byte[] tBytes = Encoding.UTF8.GetBytes(topic);
+        int remLen = 2 + 2 + tBytes.Length + 1;
+        using (var ms = new MemoryStream()) {
+            ms.WriteByte(0x82);
+            WriteVarInt(ms, remLen);
+            ms.Write(new byte[] { 0x00, 0x01 }, 0, 2);
+            ms.WriteByte((byte)(tBytes.Length >> 8));
+            ms.WriteByte((byte)(tBytes.Length & 0xFF));
+            ms.Write(tBytes, 0, tBytes.Length);
+            ms.WriteByte(0x00);
+            byte[] pkt = ms.ToArray();
+            await ws.SendAsync(new ArraySegment<byte>(pkt), WebSocketMessageType.Binary, true, CancellationToken.None);
+        }
+    }
+
+    public async Task PublishAsync(string topic, string payload) {
+        byte[] tBytes = Encoding.UTF8.GetBytes(topic);
+        byte[] pBytes = Encoding.UTF8.GetBytes(payload);
+        int remLen = 2 + tBytes.Length + pBytes.Length;
+        using (var ms = new MemoryStream()) {
+            ms.WriteByte(0x30);
+            WriteVarInt(ms, remLen);
+            ms.WriteByte((byte)(tBytes.Length >> 8));
+            ms.WriteByte((byte)(tBytes.Length & 0xFF));
+            ms.Write(tBytes, 0, tBytes.Length);
+            ms.Write(pBytes, 0, pBytes.Length);
+            byte[] pkt = ms.ToArray();
+            await ws.SendAsync(new ArraySegment<byte>(pkt), WebSocketMessageType.Binary, true, CancellationToken.None);
+        }
+    }
+
+    public async Task<string> ReceivePayloadAsync() {
+        byte[] buffer = new byte[65536];
+        using (var ms = new MemoryStream()) {
+            WebSocketReceiveResult result;
+            do {
+                result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+                if (result.MessageType == WebSocketMessageType.Close) return null;
+                ms.Write(buffer, 0, result.Count);
+            } while (!result.EndOfMessage);
+
+            byte[] data = ms.ToArray();
+            if (data.Length < 4 || (data[0] & 0xF0) != 0x30) return "";
+
+            int idx = 1;
+            int multiplier = 1, value = 0;
+            byte encodedByte;
+            do {
+                encodedByte = data[idx++];
+                value += (encodedByte & 127) * multiplier;
+                multiplier *= 128;
+            } while ((encodedByte & 128) != 0);
+
+            int topicLen = (data[idx] << 8) | data[idx + 1];
+            idx += 2 + topicLen;
+            return Encoding.UTF8.GetString(data, idx, data.Length - idx);
+        }
+    }
+
+    private void WriteVarInt(Stream s, int len) {
+        do {
+            byte b = (byte)(len % 128);
+            len /= 128;
+            if (len > 0) b |= 128;
+            s.WriteByte(b);
+        } while (len > 0);
+    }
+}
+"@
+Add-Type -TypeDefinition $csharpCode -Language CSharp
+
+$brokers = @(
+    @{ Name = "EMQX-Global"; Url = "wss://broker.emqx.io:8084/mqtt" },
+    @{ Name = "EMQX-CN";     Url = "wss://broker-cn.emqx.io:8084/mqtt" },
+    @{ Name = "Mosquitto";   Url = "wss://test.mosquitto.org:8081/mqtt" },
+    @{ Name = "HiveMQ";      Url = "wss://broker.hivemq.com:8884/mqtt" }
+)
+
+$mqtt = New-Object MiniMqttWss
+$roomId = Get-Random -Minimum 100000 -Maximum 999999
+$connectedIdx = -1
+
+Write-Host "`n[*] 正在探测高可用公共加密通道..." -ForegroundColor Cyan
+for ($i = 0; $i -lt $brokers.Count; $i++) {
+    $b = $brokers[$i]
+    Write-Host "    尝试节点 $i [$($b.Name)]..." -NoNewline
+    $ok = $mqtt.ConnectAsync($b.Url, "ps_host_$roomId").GetAwaiter().GetResult()
+    if ($ok) {
+        Write-Host " 成功!" -ForegroundColor Green
+        $connectedIdx = $i
+        break
+    } else {
+        Write-Host " 超时跳过" -ForegroundColor DarkGray
+    }
+}
+
+if ($connectedIdx -eq -1) {
+    Write-Host "[!] 所有公共节点均无法连接，请检查网络。" -ForegroundColor Red
+    return
+}
+
+$pairCode = "$connectedIdx-$roomId"
+$topicIn  = "campus_xfer/$pairCode/to_host"
+$topicOut = "campus_xfer/$pairCode/to_guest"
+$mqtt.SubscribeAsync($topicIn).GetAwaiter().GetResult()
+
+Clear-Host
+Write-Host "=====================================================" -ForegroundColor Green
+Write-Host "  🛡️  无文件落地 · 跨网文件接收终端已就绪" -ForegroundColor Green
+Write-Host "  📱 请在手机端输入配对码:  $pairCode" -ForegroundColor Yellow
+Write-Host "  📂 接收文件将自动保存到桌面 (Desktop)" -ForegroundColor Cyan
+Write-Host "=====================================================`n" -ForegroundColor Green
+
+$desktopPath = [Environment]::GetFolderPath("Desktop")
+$chunks = @{}
+$fileMeta = $null
+
+while ($true) {
+    $jsonStr = $mqtt.ReceivePayloadAsync().GetAwaiter().GetResult()
+    if ($null -eq $jsonStr) { Write-Host "[!] 连接已断开"; break }
+    if ($jsonStr -eq "") { continue }
+
+    $msg = $jsonStr | ConvertFrom-Json
+    if ($msg.type -eq "ping") {
+        $mqtt.PublishAsync($topicOut, '{"type":"pong"}').GetAwaiter().GetResult()
+        Write-Host "[+] 手机已连接！等待发送文件..." -ForegroundColor Green
+    }
+    elseif ($msg.type -eq "file-meta") {
+        $fileMeta = $msg
+        $chunks = @{}
+        Write-Host "[↓] 正在接收: $($msg.name) ($([math]::Round($msg.size / 1KB, 1)) KB)..." -ForegroundColor Cyan
+    }
+    elseif ($msg.type -eq "file-chunk") {
+        $chunks[$msg.index] = [Convert]::FromBase64String($msg.data)
+        $pct = [math]::Round(($chunks.Count / $fileMeta.totalChunks) * 100)
+        Write-Progress -Activity "正在接收 $($fileMeta.name)" -Status "$pct%" -PercentComplete $pct
+
+        if ($chunks.Count -eq $fileMeta.totalChunks) {
+            Write-Progress -Activity "正在接收 $($fileMeta.name)" -Completed
+            $savePath = Join-Path $desktopPath $fileMeta.name
+            $fs = [System.IO.File]::Create($savePath)
+            for ($k = 0; $k -lt $fileMeta.totalChunks; $k++) {
+                $fs.Write($chunks[$k], 0, $chunks[$k].Length)
+            }
+            $fs.Close()
+            Write-Host "[✔] 接收完成！已自动保存至桌面: $savePath" -ForegroundColor Green
+        }
+    }
+}
