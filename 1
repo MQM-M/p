@@ -105,7 +105,6 @@ public class MiniMqttWss {
     }
 }
 
-// 标准 ISO/IEC 18004 QR Code Version 2-L (25x25) 矩阵生成器
 public class OfflineQr {
     private const int Size = 25;
     private bool[,] modules = new bool[Size, Size];
@@ -115,7 +114,7 @@ public class OfflineQr {
         var qr = new OfflineQr();
         qr.Encode(text);
         var sb = new StringBuilder();
-        int pad = 2;
+        int pad = 3;
         int total = Size + pad * 2;
         for (int y = 0; y < total; y += 2) {
             sb.Append("  ");
@@ -160,7 +159,7 @@ public class OfflineQr {
         Array.Copy(data, 0, allBytes, 0, 34);
         Array.Copy(ecc, 0, allBytes, 34, 10);
 
-        // 1. 绘制功能模块
+        // 1. Draw function patterns
         for (int i = 0; i < Size; i++) {
             SetFunc(i, 6, i % 2 == 0);
             SetFunc(6, i, i % 2 == 0);
@@ -170,8 +169,7 @@ public class OfflineQr {
         DrawFinder(0, Size - 7);
         DrawAlignment(18, 18);
 
-        // 2. 写入标准 Format Info: ECC Level L (01) + Mask 0 (000) -> 完整 15 位 BCH+掩码结果 = 0x77C4
-        // 注意位序：bit 14 (最高位) 在 (0,8)，bit 0 (最低位) 在 (8,0)
+        // 2. Write standard Format Info (ECC L + Mask 0 = 0x77C4)
         int fmt = 0x77C4;
         for (int i = 0; i <= 5; i++) SetFunc(8, i, ((fmt >> i) & 1) != 0);
         SetFunc(8, 7, ((fmt >> 6) & 1) != 0);
@@ -181,9 +179,9 @@ public class OfflineQr {
 
         for (int i = 0; i < 8; i++) SetFunc(Size - 1 - i, 8, ((fmt >> i) & 1) != 0);
         for (int i = 8; i < 15; i++) SetFunc(8, Size - 15 + i, ((fmt >> i) & 1) != 0);
-        SetFunc(8, Size - 8, true); // 固定黑点
+        SetFunc(8, Size - 8, true);
 
-        // 3. 蛇形填充数据位 + Mask 0 ((x + y) % 2 == 0)
+        // 3. Zigzag fill data bits with Mask 0
         int bitIdx = 0;
         bool up = true;
         for (int right = Size - 1; right >= 1; right -= 2) {
