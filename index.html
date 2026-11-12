@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>高可用跨网文件直传（无视校园网防火墙）</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 500px; margin: 20px auto; padding: 0 15px; background: #f4f6f8; color: #333; }
+        .card { background: #fff; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); margin-bottom: 16px; }
+        h2 { margin-top: 0; font-size: 1.15rem; }
+        #qrcode { display: flex; justify-content: center; margin: 15px 0; }
+        .status { padding: 10px 12px; border-radius: 6px; background: #e8f0fe; color: #1967d2; font-size: 0.9rem; margin-bottom: 12px; line-height: 1.4; }
+        .status.connected { background: #e6f4ea; color: #137333; font-weight: 500; }
+        .status.error { background: #fce8e6; color: #c5221f; }
+        button, input[type="text"] { width: 100%; padding: 11px; margin: 6px 0; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box; font-size: 1rem; }
+        button { background: #1a73e8; color: white; border: none; cursor: pointer; font-weight: bold; }
+        button.secondary { background: #34a853; }
+        button:disabled { background: #a0c3ff; cursor: not-allowed; }
+        progress { width: 100%; height: 18px; margin-top: 10px; }
+        .file-item { display: block; padding: 10px; background: #f8f9fa; border: 1px solid #ddd; border-radius: 6px; margin-top: 8px; text-decoration: none; color: #1a73e8; font-weight: 500; word-break: break-all; }
+        .node-badge { font-size: 0.75rem; background: #eee; padding: 2px 6px; border-radius: 4px; color: #555; float: right; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>🛡️ 多节点容灾 · 跨网文件直传 <span id="node-info" class="node-badge">探测节点中...</span></h2>
+    <div id="status" class="status">正在自动匹配最优公共加密通道...</div>
+    
+    <div id="host-panel" style="display: none;">
+        <p style="font-size: 0.9rem; color: #666; margin-bottom: 5px;">手机拍照识别二维码，或输入下方完整配对码：</p>
+        <div id="qrcode"></div>
+        <div style="text-align: center; font-weight: bold; font-size: 1.25rem; letter-spacing: 2px; color: #1a73e8;" id="room-display"></div>
+    </div>
+
+    <div id="join-panel" style="margin-top: 15px; border-top: 1px solid #eee; padding-top: 15px;">
+        <input type="file" id="qr-file-input" accept="image/*" style="display: none;" onchange="decodeQRFromImage(event)">
+        <button class="secondary" onclick="document.getElementById('qr-file-input').click()">📷 拍照 / 选图识别电脑二维码</button>
+        
+        <div style="text-align: center; color: #999; font-size: 0.85rem; margin: 6px 0;">— 或者直接输入配对码 (如 0-884812) —</div>
+        
+        <input type="text" id="join-input" placeholder="格式: 节点号-房间号 (例如 0-884812)">
+        <button id="join-btn" onclick="manualJoin()">连接电脑</button>
+    </div>
+</div>
+
+<div class="card" id="transfer-panel" style="display: none;">
+    <h2>📁 双向文件传输（TLS 加密隧道）</h2>
+    <input type="file" id="file-input" multiple>
+    <button id="send-btn" onclick="sendFiles()">发送选中文件</button>
+    <progress id="progress" value="0" max="100" style="display: none;"></progress>
+    <div id="file-list"></div>
+</div>
+
+<canvas id="qr-canvas" style="display: none;"></canvas>
+
+<script>
+    // 全球四大独立公共 WSS 节点容灾池（自动故障转移）
+    const BROKER_POOL = [
+        { name: 'EMQX-Global', url: 'wss://broker.emqx.io:8084/mqtt' },
+        { name: 'EMQX-CN',     url: 'wss://broker-cn.emqx.io:8084/mqtt' },
+        { name: 'Mosquitto',   url: 'wss://test.mosquitto.org:8081/mqtt' },
+        { name: 'HiveMQ',      url: 'wss://broker.hivemq.com:8884/mqtt' }
+    ];
+
+    const CHUNK_SIZE = 32768; // 32KB 切片，兼顾速度与公共节点包大小限制
+    let currentBrokerIdx = 0;
+    let client = null;
+    let roomId = Math.floor(100000 + Math.random() * 900000).toString();
+    let myRole = 'host'; // 'host' 或 'guest'
+    let isConnectedPeer = false;
+
+    const statusEl = document.getElementById('status');
+    const setStatus = (msg, type = 'normal') => {
+        statusEl.textContent = msg;
+        statusEl.className = 'status' + (type === 'ok' ? ' connected' : (type === 'err' ? ' error' : ''));
+    };
+
+    // 自动故障转移连接引擎
+    function connectToBroker(idx, targetRoom = null, role = 'host') {
+        if (idx >= BROKER_POOL.length) {
+            setStatus('❌ 所有备用公共节点均无法连接，请检查当前设备是否断网。', 'err');
+            return;
+        }
+        currentBrokerIdx = idx;
+        myRole = role;
+        if (targetRoom) roomId = targetRoom;
+
+        const broker = BROKER_POOL[idx];
+        document.getElementById('node-info').textContent = `节点 ${idx}: ${broker.name}`;
+        setStatus(`正在接入通道 [${broker.name}]...`);
+
+        if (client) { try { client.end(true); } catch(e){} }
+
+        client = mqtt.connect(broker.url, { connectTimeout: 4000, reconnectPeriod: 0 });
+
+        // 4秒连不上自动切换下一个备用节点
+        const failTimer = setTimeout(() => {
+            if (!client.connected) {
+                console.warn(`节点 ${broker.name} 超时，切换下一个...`);
+                connectToBroker(idx + 1, targetRoom, role);
+            }
+        }, 4200);
+
+        client.on('connect', () => {
+            clearTimeout(failTimer);
+            const pairCode = `${idx}-${roomId}`;
+            const topicIn = `campus_xfer/${pairCode}/${myRole === 'host' ? 'to_host' : 'to_guest'}`;
+            const topicOut = `campus_xfer/${pairCode}/${myRole === 'host' ? 'to_guest' : 'to_host'}`;
+
+            client.subscribe(topicIn, (err) => {
+                if (!err) {
+                    if (myRole === 'host') {
+                        document.getElementById('host-panel').style.display = 'block';
+                        document.getElementById('room-display').textContent = `配对码: ${pairCode}`;
+                        document.getElementById('qrcode').innerHTML = '';
+                        new QRCode(document.getElementById('qrcode'), {
+                            text: `XFER:${pairCode}`,
+                            width: 180, height: 180,
+                            correctLevel: QRCode.CorrectLevel.M
+                        });
+                        setStatus(`✅ 通道就绪！完全绕过 NAT 限制，等待手机接入...`);
+                    } else {
+                        // 手机端主动发送握手信号
+                        client.publish(topicOut, JSON.stringify({ type: 'ping' }));
+                        setStatus(`已接入节点 [${broker.name}]，正在与电脑握手...`);
+                    }
+                }
+            });
+
+            // 绑定消息接收
+            client.on('message', (topic, payload) => handleIncomingData(payload, topicOut));
+        });
+
+        client.on('error', () => {
+            clearTimeout(failTimer);
+            connectToBroker(idx + 1, targetRoom, role);
+        });
+    }
+
+    // 启动默认以电脑端(Host)身份寻找最优节点
+    connectToBroker(0, roomId, 'host');
+
+    // 拍照识码
+    function decodeQRFromImage(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+        setStatus('正在本地识别二维码...');
+        const img = new Image();
+        img.onload = () => {
+            const canvas = document.getElementById('qr-canvas');
+            const ctx = canvas.getContext('2d');
+            const maxDim = 1000;
+            let w = img.width, h = img.height;
+            if (w > maxDim || h > maxDim) {
+                if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
+                else { w = Math.round(w * maxDim / h); h = maxDim; }
+            }
+            canvas.width = w; canvas.height = h;
+            ctx.drawImage(img, 0, 0, w, h);
+            const code = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: "dontInvert" });
+
+            if (code && code.data.startsWith('XFER:')) {
+                const pairCode = code.data.split(':')[1];
+                document.getElementById('join-input').value = pairCode;
+                parseAndJoin(pairCode);
+            } else {
+                setStatus('❌ 未识别到有效配对二维码，请重拍或直接输入配对码。', 'err');
+            }
+            URL.revokeObjectURL(img.src);
+        };
+        img.src = URL.createObjectURL(file);
+        event.target.value = '';
+    }
+
+    function manualJoin() {
+        const val = document.getElementById('join-input').value.trim();
+        parseAndJoin(val);
+    }
+
+    function parseAndJoin(pairCode) {
+        const parts = pairCode.split('-');
+        if (parts.length !== 2 || isNaN(parseInt(parts[0]))) {
+            return alert('配对码格式错误，应为“节点号-房间号”，例如 0-884812');
+        }
+        const targetIdx = parseInt(parts[0]);
+        const targetRoom = parts[1];
+        document.getElementById('host-panel').style.display = 'none';
+        document.getElementById('join-btn').disabled = true;
+        connectToBroker(targetIdx, targetRoom, 'guest');
+    }
+
+    // 收发数据与分片重组引擎
+    let rxChunks = [], rxMeta = null, rxCount = 0;
+
+    function handleIncomingData(payload, topicOut) {
+        const msg = JSON.parse(payload.toString());
+        if (msg.type === 'ping') {
+            client.publish(topicOut, JSON.stringify({ type: 'pong' }));
+            activateTransferUI();
+        } else if (msg.type === 'pong') {
+            activateTransferUI();
+        } else if (msg.type === 'file-meta') {
+            rxMeta = msg;
+            rxChunks = new Array(msg.totalChunks);
+            rxCount = 0;
+            document.getElementById('progress').style.display = 'block';
+            document.getElementById('progress').value = 0;
+        } else if (msg.type === 'file-chunk') {
+            rxChunks[msg.index] = base64ToUint8Array(msg.data);
+            rxCount++;
+            document.getElementById('progress').value = (rxCount / rxMeta.totalChunks) * 100;
+
+            if (rxCount === rxMeta.totalChunks) {
+                const blob = new Blob(rxChunks);
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = rxMeta.name;
+                a.className = 'file-item';
+                a.textContent = `📥 点击保存: ${rxMeta.name} (${(rxMeta.size / 1024 / 1024).toFixed(2)} MB)`;
+                document.getElementById('file-list').appendChild(a);
+                a.click();
+                document.getElementById('progress').style.display = 'none';
+            }
+        }
+    }
+
+    function activateTransferUI() {
+        if (isConnectedPeer) return;
+        isConnectedPeer = true;
+        setStatus('✅ 双向 TLS 加密传输隧道已打通！无视校园网防火墙，可直接互传文件。', 'ok');
+        document.getElementById('host-panel').style.display = 'none';
+        document.getElementById('join-panel').style.display = 'none';
+        document.getElementById('transfer-panel').style.display = 'block';
+    }
+
+    async function sendFiles() {
+        const files = document.getElementById('file-input').files;
+        if (!files.length || !client || !client.connected) return;
+        
+        const btn = document.getElementById('send-btn');
+        const progress = document.getElementById('progress');
+        btn.disabled = true;
+        progress.style.display = 'block';
+
+        const pairCode = `${currentBrokerIdx}-${roomId}`;
+        const topicOut = `campus_xfer/${pairCode}/${myRole === 'host' ? 'to_guest' : 'to_host'}`;
+
+        for (const file of files) {
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            client.publish(topicOut, JSON.stringify({
+                type: 'file-meta', name: file.name, size: file.size, totalChunks: totalChunks
+            }));
+
+            for (let i = 0; i < totalChunks; i++) {
+                const slice = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+                const buffer = await slice.arrayBuffer();
+                const b64 = uint8ArrayToBase64(new Uint8Array(buffer));
+                
+                client.publish(topicOut, JSON.stringify({
+                    type: 'file-chunk', index: i, data: b64
+                }));
+                
+                progress.value = ((i + 1) / totalChunks) * 100;
+                // 适度流控（每片间隔 15ms），防止触发公共服务器防刷限流
+                await new Promise(r => setTimeout(r, 15));
+            }
+        }
+        btn.disabled = false;
+        setTimeout(() => { progress.style.display = 'none'; }, 1000);
+    }
+
+    function uint8ArrayToBase64(bytes) {
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+        return btoa(binary);
+    }
+
+    function base64ToUint8Array(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    }
+</script>
+</body>
+</html>
