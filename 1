@@ -104,6 +104,163 @@ public class MiniMqttWss {
         } while (len > 0);
     }
 }
+
+// 纯本地离线 QR Code Version 2-L (25x25) 矩阵生成器
+public class OfflineQr {
+    private const int Size = 25;
+    private bool[,] modules = new bool[Size, Size];
+    private bool[,] isFunc = new bool[Size, Size];
+
+    public static string RenderTerminal(string text) {
+        var qr = new OfflineQr();
+        qr.Encode(text);
+        var sb = new StringBuilder();
+        int pad = 2; // 四周白边静默区
+        int total = Size + pad * 2;
+        for (int y = 0; y < total; y += 2) {
+            sb.Append("  ");
+            for (int x = 0; x < total; x++) {
+                bool topDark = qr.GetModule(x - pad, y - pad);
+                bool botDark = (y + 1 < total) ? qr.GetModule(x - pad, y + 1 - pad) : false;
+                // 黑底终端白字反转渲染：亮块代表白底，暗块代表黑码
+                if (!topDark && !botDark) sb.Append('\u2588');      // █ 上白下白
+                else if (!topDark && botDark) sb.Append('\u2580');  // ▀ 上白下黑
+                else if (topDark && !botDark) sb.Append('\u2584');  // ▄ 上黑下白
+                else sb.Append(' ');                                //   上黑下黑
+            }
+            sb.AppendLine();
+        }
+        return sb.ToString();
+    }
+
+    private bool GetModule(int x, int y) {
+        if (x < 0 || y < 0 || x >= Size || y >= Size) return false;
+        return modules[y, x];
+    }
+
+    private void Encode(string text) {
+        byte[] raw = Encoding.ASCII.GetBytes(text);
+        // 1. 构造 34 字节数据码字 (Version 2-L)
+        byte[] data = new byte[34];
+        int bitPos = 0;
+        Action<int, int> putBits = (val, len) => {
+            for (int i = len - 1; i >= 0; i--) {
+                if (((val >> i) & 1) != 0) data[bitPos >> 3] |= (byte)(1 << (7 - (bitPos & 7)));
+                bitPos++;
+            }
+        };
+        putBits(0x4, 4); // Byte mode
+        putBits(raw.Length, 8);
+        foreach (byte b in raw) putBits(b, 8);
+        putBits(0, 4);   // Terminator
+        int byteIdx = (bitPos + 7) >> 3;
+        byte[] pads = { 0xEC, 0x11 };
+        for (int i = 0; byteIdx < 34; i++, byteIdx++) data[byteIdx] = pads[i & 1];
+
+        // 2. Reed-Solomon 计算 10 字节纠错码
+        byte[] ecc = ComputeEcc(data, 10);
+        byte[] allBytes = new byte[44];
+        Array.Copy(data, 0, allBytes, 0, 34);
+        Array.Copy(ecc, 0, allBytes, 34, 10);
+
+        // 3. 绘制功能图形
+        DrawFinder(0, 0); DrawFinder(Size - 7, 0); DrawFinder(0, Size - 7);
+        DrawAlignment(18, 18);
+        for (int i = 8; i < Size - 8; i++) {
+            SetFunc(i, 6, i % 2 == 0);
+            SetFunc(6, i, i % 2 == 0);
+        }
+        SetFunc(8, Size - 8, true); // Dark module
+        ReserveFormat();
+
+        // 4. 蛇形填充数据位 + Mask 0 ((x + y) % 2 == 0)
+        int bitIdx = 0;
+        bool up = true;
+        for (int right = Size - 1; right >= 1; right -= 2) {
+            if (right == 6) right = 5;
+            for (int vert = 0; vert < Size; vert++) {
+                int y = up ? (Size - 1 - vert) : vert;
+                for (int j = 0; j < 2; j++) {
+                    int x = right - j;
+                    if (!isFunc[y, x]) {
+                        bool bit = false;
+                        if (bitIdx < allBytes.Length * 8) {
+                            bit = ((allBytes[bitIdx >> 3] >> (7 - (bitIdx & 7))) & 1) != 0;
+                            bitIdx++;
+                        }
+                        if ((x + y) % 2 == 0) bit = !bit;
+                        modules[y, x] = bit;
+                    }
+                }
+            }
+            up = !up;
+        }
+
+        // 5. 写入 Format Info (ECC L = 01, Mask 0 = 000 -> 0x77C4)
+        int fmt = 0x77C4;
+        for (int i = 0; i <= 5; i++) SetFunc(8, i, ((fmt >> i) & 1) != 0);
+        SetFunc(8, 7, ((fmt >> 6) & 1) != 0);
+        SetFunc(8, 8, ((fmt >> 7) & 1) != 0);
+        SetFunc(7, 8, ((fmt >> 8) & 1) != 0);
+        for (int i = 9; i < 15; i++) SetFunc(14 - i, 8, ((fmt >> i) & 1) != 0);
+        for (int i = 0; i < 8; i++) SetFunc(Size - 1 - i, 8, ((fmt >> i) & 1) != 0);
+        for (int i = 8; i < 15; i++) SetFunc(8, Size - 15 + i, ((fmt >> i) & 1) != 0);
+    }
+
+    private void SetFunc(int x, int y, bool dark) { modules[y, x] = dark; isFunc[y, x] = true; }
+
+    private void DrawFinder(int x, int y) {
+        for (int dy = -1; dy <= 7; dy++)
+            for (int dx = -1; dx <= 7; dx++) {
+                int xx = x + dx, yy = y + dy;
+                if (xx >= 0 && yy >= 0 && xx < Size && yy < Size) {
+                    bool dark = (dx >= 0 && dx <= 6 && dy >= 0 && dy <= 6) &&
+                                (dx == 0 || dx == 6 || dy == 0 || dy == 6 || (dx >= 2 && dx <= 4 && dy >= 2 && dy <= 4));
+                    SetFunc(xx, yy, dark);
+                }
+            }
+    }
+
+    private void DrawAlignment(int cx, int cy) {
+        for (int dy = -2; dy <= 2; dy++)
+            for (int dx = -2; dx <= 2; dx++) {
+                bool dark = Math.Abs(dx) == 2 || Math.Abs(dy) == 2 || (dx == 0 && dy == 0);
+                SetFunc(cx + dx, cy + dy, dark);
+            }
+    }
+
+    private void ReserveFormat() {
+        for (int i = 0; i < 9; i++) { isFunc[8, i] = true; isFunc[i, 8] = true; }
+        for (int i = 0; i < 8; i++) { isFunc[8, Size - 1 - i] = true; isFunc[Size - 1 - i, 8] = true; }
+    }
+
+    private byte[] ComputeEcc(byte[] data, int eccLen) {
+        byte[] gen = new byte[eccLen + 1];
+        gen[0] = 1;
+        byte root = 1;
+        for (int i = 0; i < eccLen; i++) {
+            for (int j = i + 1; j >= 1; j--) gen[j] = (byte)(gen[j] ^ GfMul(gen[j - 1], root));
+            root = GfMul(root, 2);
+        }
+        byte[] rem = new byte[eccLen];
+        foreach (byte b in data) {
+            byte factor = (byte)(b ^ rem[0]);
+            Array.Copy(rem, 1, rem, 0, eccLen - 1);
+            rem[eccLen - 1] = 0;
+            for (int j = 0; j < eccLen; j++) rem[j] = (byte)(rem[j] ^ GfMul(gen[j + 1], factor));
+        }
+        return rem;
+    }
+
+    private byte GfMul(byte x, byte y) {
+        int r = 0;
+        for (int i = 7; i >= 0; i--) {
+            r = (r << 1) ^ ((r >> 7) * 0x11D);
+            r ^= ((y >> i) & 1) * x;
+        }
+        return (byte)r;
+    }
+}
 "@
 Add-Type -TypeDefinition $csharpCode -Language CSharp
 
@@ -121,14 +278,14 @@ $connectedIdx = -1
 Write-Host "`n[*] Probing public WSS relay nodes..." -ForegroundColor Cyan
 for ($i = 0; $i -lt $brokers.Count; $i++) {
     $b = $brokers[$i]
-    Write-Host "    Node $i [$($b.Name)]..." -NoNewline
+    Write-Host ("    Node {0} [{1,-11}] ... " -f $i, $b.Name) -NoNewline
     $ok = $mqtt.ConnectAsync($b.Url, "ps_host_$roomId").GetAwaiter().GetResult()
     if ($ok) {
-        Write-Host " OK!" -ForegroundColor Green
+        Write-Host "OK!" -ForegroundColor Green
         $connectedIdx = $i
         break
     } else {
-        Write-Host " Timeout" -ForegroundColor DarkGray
+        Write-Host "Timeout" -ForegroundColor DarkGray
     }
 }
 
@@ -142,25 +299,20 @@ $topicIn  = "campus_xfer/$pairCode/to_host"
 $topicOut = "campus_xfer/$pairCode/to_guest"
 [void]$mqtt.SubscribeAsync($topicIn).GetAwaiter().GetResult()
 
-# 强制终端切换 UTF-8 输出以完美渲染 Unicode 二维码块字符
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-
 Clear-Host
-Write-Host "=====================================================" -ForegroundColor Green
-Write-Host "  [READY] Fileless P2P Receiver Online" -ForegroundColor Green
-Write-Host "  [PAIR CODE] Enter on phone:  $pairCode" -ForegroundColor Yellow
-Write-Host "  [SAVE PATH] Auto-save to Desktop" -ForegroundColor Cyan
-Write-Host "=====================================================" -ForegroundColor Green
 
-# 尝试在终端直接渲染 Unicode 二维码（内容为 XFER:节点号-房间号，与手机拍照识码完全兼容）
-try {
-    $qrAscii = Invoke-RestMethod -Uri "https://qrenco.de/XFER:$pairCode" -UserAgent "curl/7.88.1" -TimeoutSec 2
-    if ($qrAscii) {
-        Write-Host $qrAscii -ForegroundColor White
-    }
-} catch {
-    # 若该接口被防火墙拦截则静默跳过，直接看上方黄色数字配对码即可
-}
+# 强制等宽框线对齐输出
+$border = "+---------------------------------------------------+"
+Write-Host $border -ForegroundColor Green
+Write-Host ("| {0,-49} |" -f "[READY] Fileless P2P Receiver Online") -ForegroundColor Green
+Write-Host ("| {0,-49} |" -f "[PAIR CODE] Enter on phone:  $pairCode") -ForegroundColor Yellow
+Write-Host ("| {0,-49} |" -f "[SAVE PATH] Auto-save to Desktop") -ForegroundColor Cyan
+Write-Host "$border`n" -ForegroundColor Green
+
+# 离线秒级生成并打印终端二维码
+$qrMatrix = [OfflineQr]::RenderTerminal("XFER:$pairCode")
+Write-Host $qrMatrix -ForegroundColor White
 
 $desktopPath = [Environment]::GetFolderPath("Desktop")
 $chunks = @{}
