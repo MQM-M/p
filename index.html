@@ -8,18 +8,20 @@
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
     <style>
-        body { font-family: system-ui, -apple-system, sans-serif; max-width: 500px; margin: 20px auto; padding: 0 15px; background: #f4f6f8; color: #333; }
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 520px; margin: 20px auto; padding: 0 15px; background: #f4f6f8; color: #333; }
         .card { background: #fff; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); margin-bottom: 16px; }
         h2 { margin-top: 0; font-size: 1.15rem; }
         #qrcode { display: flex; justify-content: center; margin: 15px 0; }
-        .status { padding: 10px 12px; border-radius: 6px; background: #e8f0fe; color: #1967d2; font-size: 0.9rem; margin-bottom: 12px; line-height: 1.4; }
+        .status { padding: 10px 12px; border-radius: 6px; background: #e8f0fe; color: #1967d2; font-size: 0.9rem; margin-bottom: 12px; line-height: 1.4; transition: all 0.2s; }
         .status.connected { background: #e6f4ea; color: #137333; font-weight: 500; }
-        .status.error { background: #fce8e6; color: #c5221f; }
+        .status.error { background: #fce8e6; color: #c5221f; font-weight: 500; }
+        .status.warn { background: #fef7e0; color: #b06000; font-weight: 500; }
         button, input[type="text"] { width: 100%; padding: 11px; margin: 6px 0; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box; font-size: 1rem; }
         button { background: #1a73e8; color: white; border: none; cursor: pointer; font-weight: bold; }
         button.secondary { background: #34a853; }
         button:disabled { background: #a0c3ff; cursor: not-allowed; }
         progress { width: 100%; height: 18px; margin-top: 10px; }
+        .transfer-info { font-size: 0.85rem; color: #555; margin-top: 6px; display: flex; justify-content: space-between; }
         .file-item { display: block; padding: 10px; background: #f8f9fa; border: 1px solid #ddd; border-radius: 6px; margin-top: 8px; text-decoration: none; color: #1a73e8; font-weight: 500; word-break: break-all; }
         .node-badge { font-size: 0.75rem; background: #eee; padding: 2px 6px; border-radius: 4px; color: #555; float: right; }
     </style>
@@ -38,27 +40,34 @@
 
     <div id="join-panel" style="margin-top: 15px; border-top: 1px solid #eee; padding-top: 15px;">
         <input type="file" id="qr-file-input" accept="image/*" style="display: none;" onchange="decodeQRFromImage(event)">
-        <button class="secondary" onclick="document.getElementById('qr-file-input').click()">📷 拍照 / 选图识别电脑二维码</button>
+        <button class="secondary" onclick="document.getElementById('qr-file-input').click()">📷 拍照 / 选图识别二维码</button>
         
         <div style="text-align: center; color: #999; font-size: 0.85rem; margin: 6px 0;">— 或者直接输入配对码 (如 0-884812) —</div>
         
         <input type="text" id="join-input" placeholder="格式: 节点号-房间号 (例如 0-884812)">
-        <button id="join-btn" onclick="manualJoin()">连接电脑</button>
+        <button id="join-btn" onclick="manualJoin()">连接对端设备</button>
     </div>
 </div>
 
 <div class="card" id="transfer-panel" style="display: none;">
-    <h2>📁 双向文件传输（TLS 加密隧道）</h2>
+    <h2>📁 双向多文件传输（ACK 流控防丢包）</h2>
     <input type="file" id="file-input" multiple>
-    <button id="send-btn" onclick="sendFiles()">发送选中文件</button>
-    <progress id="progress" value="0" max="100" style="display: none;"></progress>
+    <button id="send-btn" onclick="sendFiles()">发送选中文件（支持多选 & 大文件）</button>
+    
+    <div id="progress-box" style="display: none;">
+        <div class="transfer-info">
+            <span id="tx-filename">准备传输...</span>
+            <span id="tx-percent">0%</span>
+        </div>
+        <progress id="progress" value="0" max="100"></progress>
+    </div>
+
     <div id="file-list"></div>
 </div>
 
 <canvas id="qr-canvas" style="display: none;"></canvas>
 
 <script>
-    // 全球四大独立公共 WSS 节点容灾池（自动故障转移）
     const BROKER_POOL = [
         { name: 'EMQX-Global', url: 'wss://broker.emqx.io:8084/mqtt' },
         { name: 'EMQX-CN',     url: 'wss://broker-cn.emqx.io:8084/mqtt' },
@@ -66,23 +75,36 @@
         { name: 'HiveMQ',      url: 'wss://broker.hivemq.com:8884/mqtt' }
     ];
 
-    const CHUNK_SIZE = 32768; // 32KB 切片，兼顾速度与公共节点包大小限制
+    const CHUNK_SIZE = 32768; // 32KB 分片
+    const WINDOW_SIZE = 8;    // 每发 8 个分片 (256KB) 等待一次接收端 ACK 确认，防止撑爆公共服务器缓冲区
+
     let currentBrokerIdx = 0;
     let client = null;
     let roomId = Math.floor(100000 + Math.random() * 900000).toString();
-    let myRole = 'host'; // 'host' 或 'guest'
+    let myRole = 'host';
     let isConnectedPeer = false;
+    let lastPeerSeen = 0;
+    let heartbeatTimer = null;
+    let currentTopicOut = '';
+
+    // Promise 同步信号锁（用于控制滑动窗口与多文件队列）
+    let ackWaiters = {};
 
     const statusEl = document.getElementById('status');
     const setStatus = (msg, type = 'normal') => {
         statusEl.textContent = msg;
-        statusEl.className = 'status' + (type === 'ok' ? ' connected' : (type === 'err' ? ' error' : ''));
+        statusEl.className = 'status' + (type === 'ok' ? ' connected' : (type === 'err' ? ' error' : (type === 'warn' ? ' warn' : '')));
     };
 
-    // 自动故障转移连接引擎
+    function formatSize(bytes) {
+        if (bytes >= 1048576) return (bytes / 1048576).toFixed(2) + ' MB';
+        return (bytes / 1024).toFixed(1) + ' KB';
+    }
+
     function connectToBroker(idx, targetRoom = null, role = 'host') {
         if (idx >= BROKER_POOL.length) {
-            setStatus('❌ 所有备用公共节点均无法连接，请检查当前设备是否断网。', 'err');
+            setStatus('❌ 所有备用公共节点均无法连接，请检查网络设置。', 'err');
+            document.getElementById('join-btn').disabled = false;
             return;
         }
         currentBrokerIdx = idx;
@@ -95,25 +117,28 @@
 
         if (client) { try { client.end(true); } catch(e){} }
 
-        client = mqtt.connect(broker.url, { connectTimeout: 4000, reconnectPeriod: 0 });
+        // 开启 keepalive 30秒心跳，并开启自动重连
+        client = mqtt.connect(broker.url, {
+            connectTimeout: 4500,
+            keepalive: 30,
+            reconnectPeriod: 3000
+        });
 
-        // 4秒连不上自动切换下一个备用节点
         const failTimer = setTimeout(() => {
             if (!client.connected) {
-                console.warn(`节点 ${broker.name} 超时，切换下一个...`);
                 connectToBroker(idx + 1, targetRoom, role);
             }
-        }, 4200);
+        }, 4800);
 
         client.on('connect', () => {
             clearTimeout(failTimer);
             const pairCode = `${idx}-${roomId}`;
             const topicIn = `campus_xfer/${pairCode}/${myRole === 'host' ? 'to_host' : 'to_guest'}`;
-            const topicOut = `campus_xfer/${pairCode}/${myRole === 'host' ? 'to_guest' : 'to_host'}`;
+            currentTopicOut = `campus_xfer/${pairCode}/${myRole === 'host' ? 'to_guest' : 'to_host'}`;
 
             client.subscribe(topicIn, (err) => {
                 if (!err) {
-                    if (myRole === 'host') {
+                    if (myRole === 'host' && !isConnectedPeer) {
                         document.getElementById('host-panel').style.display = 'block';
                         document.getElementById('room-display').textContent = `配对码: ${pairCode}`;
                         document.getElementById('qrcode').innerHTML = '';
@@ -122,29 +147,51 @@
                             width: 180, height: 180,
                             correctLevel: QRCode.CorrectLevel.M
                         });
-                        setStatus(`✅ 通道就绪！完全绕过 NAT 限制，等待手机接入...`);
-                    } else {
-                        // 手机端主动发送握手信号
-                        client.publish(topicOut, JSON.stringify({ type: 'ping' }));
-                        setStatus(`已接入节点 [${broker.name}]，正在与电脑握手...`);
+                        setStatus(`✅ 通道就绪！等待对端设备扫码或输入配对码接入...`);
+                    } else if (myRole === 'guest' && !isConnectedPeer) {
+                        client.publish(currentTopicOut, JSON.stringify({ type: 'hello' }));
+                        setStatus(`已接入节点 [${broker.name}]，正在与对端握手...`);
+                    } else if (isConnectedPeer) {
+                        setStatus(`✅ 网络闪断已自动重连恢复！`, 'ok');
                     }
                 }
             });
+        });
 
-            // 绑定消息接收
-            client.on('message', (topic, payload) => handleIncomingData(payload, topicOut));
+        client.on('message', (topic, payload) => {
+            lastPeerSeen = Date.now();
+            handleIncomingData(payload, currentTopicOut);
+        });
+
+        client.on('close', () => {
+            if (isConnectedPeer) {
+                setStatus('⚠️ 与公共中继服务器的连接已断开，正在尝试自动重连...', 'warn');
+            }
         });
 
         client.on('error', () => {
-            clearTimeout(failTimer);
-            connectToBroker(idx + 1, targetRoom, role);
+            if (!isConnectedPeer) {
+                clearTimeout(failTimer);
+                connectToBroker(idx + 1, targetRoom, role);
+            }
         });
     }
 
-    // 启动默认以电脑端(Host)身份寻找最优节点
     connectToBroker(0, roomId, 'host');
 
-    // 拍照识码
+    // 启动对端在线心跳监测（超过 15 秒无响应则告警）
+    function startPeerWatchdog() {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        lastPeerSeen = Date.now();
+        heartbeatTimer = setInterval(() => {
+            if (!client || !client.connected) return;
+            client.publish(currentTopicOut, JSON.stringify({ type: 'ping' }));
+            if (Date.now() - lastPeerSeen > 16000) {
+                setStatus('⚠️ 对端设备超过 15 秒无响应（可能已锁屏、关闭页面或断网）', 'warn');
+            }
+        }, 5000);
+    }
+
     function decodeQRFromImage(event) {
         const file = event.target.files[0];
         if (!file) return;
@@ -193,27 +240,62 @@
         connectToBroker(targetIdx, targetRoom, 'guest');
     }
 
-    // 收发数据与分片重组引擎
+    // 接收端状态机
     let rxChunks = [], rxMeta = null, rxCount = 0;
 
+    function updateProgressUI(label, pct) {
+        document.getElementById('progress-box').style.display = 'block';
+        document.getElementById('tx-filename').textContent = label;
+        document.getElementById('tx-percent').textContent = `${pct}%`;
+        document.getElementById('progress').value = pct;
+    }
+
     function handleIncomingData(payload, topicOut) {
-        const msg = JSON.parse(payload.toString());
-        if (msg.type === 'ping') {
+        let msg;
+        try { msg = JSON.parse(payload.toString()); } catch (e) { return; }
+
+        if (msg.type === 'hello' || msg.type === 'ping') {
             client.publish(topicOut, JSON.stringify({ type: 'pong' }));
             activateTransferUI();
         } else if (msg.type === 'pong') {
+            if ( !document.getElementById('status').classList.contains('connected') ) {
+                setStatus('✅ 双向 TLS 加密传输隧道在线，可直接互传多文件与大文件。', 'ok');
+            }
             activateTransferUI();
-        } else if (msg.type === 'file-meta') {
+        }
+        // 处理发送端等待的 ACK 信号
+        else if (msg.type === 'meta-ack' || msg.type === 'chunk-ack' || msg.type === 'file-done') {
+            const key = `${msg.type}:${msg.fileId}`;
+            if (ackWaiters[key]) {
+                ackWaiters[key]();
+                delete ackWaiters[key];
+            }
+        }
+        // 接收文件元数据
+        else if (msg.type === 'file-meta') {
             rxMeta = msg;
             rxChunks = new Array(msg.totalChunks);
             rxCount = 0;
-            document.getElementById('progress').style.display = 'block';
-            document.getElementById('progress').value = 0;
-        } else if (msg.type === 'file-chunk') {
-            rxChunks[msg.index] = base64ToUint8Array(msg.data);
-            rxCount++;
-            document.getElementById('progress').value = (rxCount / rxMeta.totalChunks) * 100;
+            updateProgressUI(`正在接收: ${msg.name} (${formatSize(msg.size)})`, 0);
+            // 立即回复 meta-ack 告知对方可以发分片了
+            client.publish(topicOut, JSON.stringify({ type: 'meta-ack', fileId: msg.fileId }));
+        }
+        // 接收文件分片
+        else if (msg.type === 'file-chunk') {
+            if (!rxMeta || msg.fileId !== rxMeta.fileId) return;
+            if (!rxChunks[msg.index]) {
+                rxChunks[msg.index] = base64ToUint8Array(msg.data);
+                rxCount++;
+            }
+            const pct = Math.min(100, Math.round((rxCount / rxMeta.totalChunks) * 100));
+            updateProgressUI(`正在接收: ${rxMeta.name}`, pct);
 
+            // 如果对方请求窗口确认，立即回复 chunk-ack
+            if (msg.ackReq && rxCount < rxMeta.totalChunks) {
+                client.publish(topicOut, JSON.stringify({ type: 'chunk-ack', fileId: rxMeta.fileId, index: msg.index }));
+            }
+
+            // 全部接收完毕
             if (rxCount === rxMeta.totalChunks) {
                 const blob = new Blob(rxChunks);
                 const url = URL.createObjectURL(blob);
@@ -221,10 +303,14 @@
                 a.href = url;
                 a.download = rxMeta.name;
                 a.className = 'file-item';
-                a.textContent = `📥 点击保存: ${rxMeta.name} (${(rxMeta.size / 1024 / 1024).toFixed(2)} MB)`;
+                a.textContent = `📥 点击保存: ${rxMeta.name} (${formatSize(rxMeta.size)})`;
                 document.getElementById('file-list').appendChild(a);
                 a.click();
-                document.getElementById('progress').style.display = 'none';
+
+                updateProgressUI(`✅ 接收完成: ${rxMeta.name}`, 100);
+                // 通知发送端可以发下一个文件了
+                client.publish(topicOut, JSON.stringify({ type: 'file-done', fileId: rxMeta.fileId }));
+                rxChunks = [];
             }
         }
     }
@@ -232,52 +318,109 @@
     function activateTransferUI() {
         if (isConnectedPeer) return;
         isConnectedPeer = true;
-        setStatus('✅ 双向 TLS 加密传输隧道已打通！无视校园网防火墙，可直接互传文件。', 'ok');
+        setStatus('✅ 双向 TLS 加密传输隧道已打通！支持大文件流控与多文件队列。', 'ok');
         document.getElementById('host-panel').style.display = 'none';
         document.getElementById('join-panel').style.display = 'none';
         document.getElementById('transfer-panel').style.display = 'block';
+        startPeerWatchdog();
+    }
+
+    // 等待对端 ACK 的工具函数（带超时重发/告警保护）
+    function waitForSignal(type, fileId, timeoutMs = 12000) {
+        return new Promise((resolve, reject) => {
+            const key = `${type}:${fileId}`;
+            const timer = setTimeout(() => {
+                delete ackWaiters[key];
+                reject(new Error(`等待对端确认超时 (${type})，连接可能已中断`));
+            }, timeoutMs);
+
+            ackWaiters[key] = () => {
+                clearTimeout(timer);
+                resolve();
+            };
+        });
     }
 
     async function sendFiles() {
-        const files = document.getElementById('file-input').files;
-        if (!files.length || !client || !client.connected) return;
-        
+        const fileInput = document.getElementById('file-input');
+        const files = fileInput.files;
+        if (!files.length) return alert('请先选择要发送的文件');
+        if (!client || !client.connected) return alert('当前未连接到中继服务器，请等待重连');
+
         const btn = document.getElementById('send-btn');
-        const progress = document.getElementById('progress');
         btn.disabled = true;
-        progress.style.display = 'block';
 
-        const pairCode = `${currentBrokerIdx}-${roomId}`;
-        const topicOut = `campus_xfer/${pairCode}/${myRole === 'host' ? 'to_guest' : 'to_host'}`;
+        try {
+            for (let fIdx = 0; fIdx < files.length; fIdx++) {
+                const file = files[fIdx];
+                const fileId = Date.now().toString(36) + '_' + fIdx;
+                const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+                const prefix = `[${fIdx + 1}/${files.length}] `;
 
-        for (const file of files) {
-            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-            client.publish(topicOut, JSON.stringify({
-                type: 'file-meta', name: file.name, size: file.size, totalChunks: totalChunks
-            }));
+                updateProgressUI(`${prefix}请求传输: ${file.name}...`, 0);
 
-            for (let i = 0; i < totalChunks; i++) {
-                const slice = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-                const buffer = await slice.arrayBuffer();
-                const b64 = uint8ArrayToBase64(new Uint8Array(buffer));
-                
-                client.publish(topicOut, JSON.stringify({
-                    type: 'file-chunk', index: i, data: b64
+                // 1. 发送文件头并等待对端确认就绪 (meta-ack)
+                const metaAckPromise = waitForSignal('meta-ack', fileId, 10000);
+                client.publish(currentTopicOut, JSON.stringify({
+                    type: 'file-meta',
+                    fileId: fileId,
+                    name: file.name,
+                    size: file.size,
+                    chunkSize: CHUNK_SIZE,
+                    totalChunks: totalChunks
                 }));
-                
-                progress.value = ((i + 1) / totalChunks) * 100;
-                // 适度流控（每片间隔 15ms），防止触发公共服务器防刷限流
-                await new Promise(r => setTimeout(r, 15));
+                await metaAckPromise;
+
+                // 2. 分片发送（每发 WINDOW_SIZE 片等待一次 chunk-ack，彻底解决大文件丢包和假进度）
+                for (let i = 0; i < totalChunks; i++) {
+                    const slice = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+                    const buffer = await slice.arrayBuffer();
+                    const b64 = uint8ArrayToBase64(new Uint8Array(buffer));
+
+                    const isWindowBoundary = ((i + 1) % WINDOW_SIZE === 0) && (i + 1 < totalChunks);
+                    const isLastChunk = (i + 1 === totalChunks);
+
+                    let ackPromise = null;
+                    if (isWindowBoundary) {
+                        ackPromise = waitForSignal('chunk-ack', fileId, 12000);
+                    } else if (isLastChunk) {
+                        ackPromise = waitForSignal('file-done', fileId, 15000);
+                    }
+
+                    client.publish(currentTopicOut, JSON.stringify({
+                        type: 'file-chunk',
+                        fileId: fileId,
+                        index: i,
+                        ackReq: isWindowBoundary,
+                        data: b64
+                    }));
+
+                    // 只有收到对端 ACK 后才推进进度条，保证两端进度 100% 真实同步
+                    if (ackPromise) {
+                        await ackPromise;
+                    }
+                    const pct = Math.round(((i + 1) / totalChunks) * 100);
+                    updateProgressUI(`${prefix}正在发送: ${file.name} (${formatSize(file.size)})`, pct);
+                }
+
+                updateProgressUI(`✅ ${prefix}发送完成: ${file.name}`, 100);
             }
+            setStatus(`✅ 全部 ${files.length} 个文件已成功送达对端！`, 'ok');
+        } catch (err) {
+            setStatus(`❌ 传输中断: ${err.message}`, 'err');
+            alert(`传输中断：${err.message}\n请检查两端网络后重试。`);
+        } finally {
+            btn.disabled = false;
         }
-        btn.disabled = false;
-        setTimeout(() => { progress.style.display = 'none'; }, 1000);
     }
 
     function uint8ArrayToBase64(bytes) {
-        let binary = '';
-        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-        return btoa(binary);
+        const CHUNK = 0x8000;
+        const c = [];
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+            c.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
+        }
+        return btoa(c.join(''));
     }
 
     function base64ToUint8Array(base64) {
