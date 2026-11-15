@@ -10,9 +10,14 @@ using System.Threading.Tasks;
 
 public class MiniMqttWss {
     private ClientWebSocket ws = new ClientWebSocket();
+    private SemaphoreSlim sendLock = new SemaphoreSlim(1, 1);
+    private CancellationTokenSource keepAliveCts;
+
+    public bool IsConnected => ws != null && ws.State == WebSocketState.Open;
 
     public async Task<bool> ConnectAsync(string url, string clientId) {
         try {
+            ws = new ClientWebSocket();
             ws.Options.AddSubProtocol("mqtt");
             var cts = new CancellationTokenSource(4500);
             await ws.ConnectAsync(new Uri(url), cts.Token);
@@ -22,17 +27,42 @@ public class MiniMqttWss {
             using (var ms = new MemoryStream()) {
                 ms.WriteByte(0x10);
                 WriteVarInt(ms, remLen);
+                // KeepAlive 设为 60 秒 (0x00, 0x3C)
                 ms.Write(new byte[] { 0x00, 0x04, (byte)'M', (byte)'Q', (byte)'T', (byte)'T', 0x04, 0x02, 0x00, 0x3C }, 0, 10);
                 ms.WriteByte((byte)(idBytes.Length >> 8));
                 ms.WriteByte((byte)(idBytes.Length & 0xFF));
                 ms.Write(idBytes, 0, idBytes.Length);
-                byte[] pkt = ms.ToArray();
-                await ws.SendAsync(new ArraySegment<byte>(pkt), WebSocketMessageType.Binary, true, CancellationToken.None);
+                await SendRawAsync(ms.ToArray());
             }
             byte[] buf = new byte[64];
             var res = await ws.ReceiveAsync(new ArraySegment<byte>(buf), cts.Token);
-            return res.Count >= 4 && buf[0] == 0x20 && buf[3] == 0x00;
+            bool ok = res.Count >= 4 && buf[0] == 0x20 && buf[3] == 0x00;
+            if (ok) StartKeepAlive();
+            return ok;
         } catch { return false; }
+    }
+
+    private void StartKeepAlive() {
+        keepAliveCts = new CancellationTokenSource();
+        var token = keepAliveCts.Token;
+        Task.Run(async () => {
+            while (!token.IsCancellationRequested && IsConnected) {
+                await Task.Delay(25000, token);
+                // 定期发送 MQTT PINGREQ (0xC0 0x00) 防止传大文件时被服务器踢下线
+                if (IsConnected) await SendRawAsync(new byte[] { 0xC0, 0x00 });
+            }
+        }, token);
+    }
+
+    private async Task SendRawAsync(byte[] pkt) {
+        await sendLock.WaitAsync();
+        try {
+            if (IsConnected) {
+                await ws.SendAsync(new ArraySegment<byte>(pkt), WebSocketMessageType.Binary, true, CancellationToken.None);
+            }
+        } finally {
+            sendLock.Release();
+        }
     }
 
     public async Task SubscribeAsync(string topic) {
@@ -46,8 +76,7 @@ public class MiniMqttWss {
             ms.WriteByte((byte)(tBytes.Length & 0xFF));
             ms.Write(tBytes, 0, tBytes.Length);
             ms.WriteByte(0x00);
-            byte[] pkt = ms.ToArray();
-            await ws.SendAsync(new ArraySegment<byte>(pkt), WebSocketMessageType.Binary, true, CancellationToken.None);
+            await SendRawAsync(ms.ToArray());
         }
     }
 
@@ -62,8 +91,7 @@ public class MiniMqttWss {
             ms.WriteByte((byte)(tBytes.Length & 0xFF));
             ms.Write(tBytes, 0, tBytes.Length);
             ms.Write(pBytes, 0, pBytes.Length);
-            byte[] pkt = ms.ToArray();
-            await ws.SendAsync(new ArraySegment<byte>(pkt), WebSocketMessageType.Binary, true, CancellationToken.None);
+            await SendRawAsync(ms.ToArray());
         }
     }
 
@@ -71,13 +99,18 @@ public class MiniMqttWss {
         byte[] buffer = new byte[65536];
         using (var ms = new MemoryStream()) {
             WebSocketReceiveResult result;
-            do {
-                result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
-                if (result.MessageType == WebSocketMessageType.Close) return null;
-                ms.Write(buffer, 0, result.Count);
-            } while (!result.EndOfMessage);
+            try {
+                do {
+                    result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+                    if (result.MessageType == WebSocketMessageType.Close) return null;
+                    ms.Write(buffer, 0, result.Count);
+                } while (!result.EndOfMessage);
+            } catch {
+                return null;
+            }
 
             byte[] data = ms.ToArray();
+            // 忽略 PINGRESP (0xD0) 或 SUBACK (0x90) 等非 PUBLISH 控制报文
             if (data.Length < 4 || (data[0] & 0xF0) != 0x30) return "";
 
             int idx = 1;
@@ -91,6 +124,8 @@ public class MiniMqttWss {
 
             int topicLen = (data[idx] << 8) | data[idx + 1];
             idx += 2 + topicLen;
+            if ((data[0] & 0x06) > 0) idx += 2; // 兼容 QoS > 0 时的 Packet Identifier
+            if (idx >= data.Length) return "";
             return Encoding.UTF8.GetString(data, idx, data.Length - idx);
         }
     }
@@ -159,7 +194,6 @@ public class OfflineQr {
         Array.Copy(data, 0, allBytes, 0, 34);
         Array.Copy(ecc, 0, allBytes, 34, 10);
 
-        // 1. Draw function patterns
         for (int i = 0; i < Size; i++) {
             SetFunc(i, 6, i % 2 == 0);
             SetFunc(6, i, i % 2 == 0);
@@ -169,7 +203,6 @@ public class OfflineQr {
         DrawFinder(0, Size - 7);
         DrawAlignment(18, 18);
 
-        // 2. Write standard Format Info (ECC L + Mask 0 = 0x77C4)
         int fmt = 0x77C4;
         for (int i = 0; i <= 5; i++) SetFunc(8, i, ((fmt >> i) & 1) != 0);
         SetFunc(8, 7, ((fmt >> 6) & 1) != 0);
@@ -181,7 +214,6 @@ public class OfflineQr {
         for (int i = 8; i < 15; i++) SetFunc(8, Size - 15 + i, ((fmt >> i) & 1) != 0);
         SetFunc(8, Size - 8, true);
 
-        // 3. Zigzag fill data bits with Mask 0
         int bitIdx = 0;
         bool up = true;
         for (int right = Size - 1; right >= 1; right -= 2) {
@@ -255,7 +287,10 @@ public class OfflineQr {
     }
 }
 "@
-Add-Type -TypeDefinition $csharpCode -Language CSharp
+
+if (-not ("MiniMqttWss" -as [type])) {
+    Add-Type -TypeDefinition $csharpCode -Language CSharp
+}
 
 $brokers = @(
     @{ Name = "EMQX-Global"; Url = "wss://broker.emqx.io:8084/mqtt" },
@@ -297,7 +332,7 @@ Clear-Host
 
 $border = "+---------------------------------------------------+"
 Write-Host $border -ForegroundColor Green
-Write-Host ("| {0,-49} |" -f "[READY] Fileless P2P Receiver Online") -ForegroundColor Green
+Write-Host ("| {0,-49} |" -f "[READY] Fileless P2P Receiver Online (ACK Flow)") -ForegroundColor Green
 Write-Host ("| {0,-49} |" -f "[PAIR CODE] Enter on phone:  $pairCode") -ForegroundColor Yellow
 Write-Host ("| {0,-49} |" -f "[SAVE PATH] Auto-save to Desktop") -ForegroundColor Cyan
 Write-Host "$border`n" -ForegroundColor Green
@@ -306,38 +341,92 @@ $qrMatrix = [OfflineQr]::RenderTerminal("XFER:$pairCode")
 Write-Host $qrMatrix -ForegroundColor White
 
 $desktopPath = [Environment]::GetFolderPath("Desktop")
-$chunks = @{}
 $fileMeta = $null
+$fs = $null
+$tempPath = $null
+$finalPath = $null
+$receivedCount = 0
 
-while ($true) {
-    $jsonStr = $mqtt.ReceivePayloadAsync().GetAwaiter().GetResult()
-    if ($null -eq $jsonStr) { Write-Host "[!] Disconnected"; break }
-    if ($jsonStr -eq "") { continue }
+try {
+    while ($true) {
+        $jsonStr = $mqtt.ReceivePayloadAsync().GetAwaiter().GetResult()
+        if ($null -eq $jsonStr) {
+            Write-Host "`n[!] Connection lost! Broker closed the WebSocket." -ForegroundColor Red
+            break
+        }
+        if ($jsonStr -eq "") { continue }
 
-    $msg = $jsonStr | ConvertFrom-Json
-    if ($msg.type -eq "ping") {
-        [void]$mqtt.PublishAsync($topicOut, '{"type":"pong"}').GetAwaiter().GetResult()
-        Write-Host "[+] Phone connected! Waiting for files..." -ForegroundColor Green
-    }
-    elseif ($msg.type -eq "file-meta") {
-        $fileMeta = $msg
-        $chunks = @{}
-        Write-Host "[RX] Receiving: $($msg.name) ($([math]::Round($msg.size / 1KB, 1)) KB)..." -ForegroundColor Cyan
-    }
-    elseif ($msg.type -eq "file-chunk") {
-        $chunks[$msg.index] = [Convert]::FromBase64String($msg.data)
-        $pct = [math]::Round(($chunks.Count / $fileMeta.totalChunks) * 100)
-        Write-Progress -Activity "Receiving $($fileMeta.name)" -Status "$pct%" -PercentComplete $pct
+        try {
+            $msg = $jsonStr | ConvertFrom-Json
+        } catch {
+            continue
+        }
 
-        if ($chunks.Count -eq $fileMeta.totalChunks) {
-            Write-Progress -Activity "Receiving $($fileMeta.name)" -Completed
-            $savePath = Join-Path $desktopPath $fileMeta.name
-            $fs = [System.IO.File]::Create($savePath)
-            for ($k = 0; $k -lt $fileMeta.totalChunks; $k++) {
-                $fs.Write($chunks[$k], 0, $chunks[$k].Length)
+        if ($msg.type -eq "ping") {
+            [void]$mqtt.PublishAsync($topicOut, '{"type":"pong"}').GetAwaiter().GetResult()
+        }
+        elseif ($msg.type -eq "hello") {
+            [void]$mqtt.PublishAsync($topicOut, '{"type":"pong"}').GetAwaiter().GetResult()
+            Write-Host "[+] Peer device connected! Ready for multi-file transfer..." -ForegroundColor Green
+        }
+        elseif ($msg.type -eq "file-meta") {
+            if ($null -ne $fs) { $fs.Close(); $fs = $null }
+            $fileMeta = $msg
+            $receivedCount = 0
+
+            # 安全过滤：剥离任何 ../ 路径穿越字符，且若同名文件已存在则自动加时间戳防覆盖
+            $safeName = [System.IO.Path]::GetFileName($msg.name)
+            if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = "received_file.bin" }
+            $finalPath = Join-Path $desktopPath $safeName
+            if (Test-Path $finalPath) {
+                $base = [System.IO.Path]::GetFileNameWithoutExtension($safeName)
+                $ext  = [System.IO.Path]::GetExtension($safeName)
+                $stamp = (Get-Date).ToString("HHmmss")
+                $finalPath = Join-Path $desktopPath "${base}_${stamp}${ext}"
             }
-            $fs.Close()
-            Write-Host "[OK] Saved to Desktop: $savePath" -ForegroundColor Green
+            $tempPath = "$finalPath.part"
+            $fs = [System.IO.File]::Open($tempPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+
+            $sizeStr = if ($msg.size -ge 1MB) { "$([math]::Round($msg.size / 1MB, 2)) MB" } else { "$([math]::Round($msg.size / 1KB, 1)) KB" }
+            Write-Host "`n[RX] Receiving: $safeName ($sizeStr, $($msg.totalChunks) chunks)..." -ForegroundColor Cyan
+
+            # 通知发送端：本地文件句柄已就绪，可以开始发第 1 批数据
+            $ackMeta = '{"type":"meta-ack","fileId":"' + $msg.fileId + '"}'
+            [void]$mqtt.PublishAsync($topicOut, $ackMeta).GetAwaiter().GetResult()
+        }
+        elseif ($msg.type -eq "file-chunk") {
+            if ($null -eq $fs -or $msg.fileId -ne $fileMeta.fileId) { continue }
+
+            $bytes = [Convert]::FromBase64String($msg.data)
+            $chunkSize = if ($fileMeta.chunkSize) { [long]$fileMeta.chunkSize } else { 32768L }
+            $offset = [long]$msg.index * $chunkSize
+            $fs.Seek($offset, [System.IO.SeekOrigin]::Begin) | Out-Null
+            $fs.Write($bytes, 0, $bytes.Length)
+            $receivedCount++
+
+            $pct = [math]::Min(100, [math]::Round(($receivedCount / $fileMeta.totalChunks) * 100))
+            Write-Progress -Activity "Receiving $($fileMeta.name)" -Status "$pct% ($receivedCount / $($fileMeta.totalChunks))" -PercentComplete $pct
+
+            # 如果发送端请求窗口确认（ackReq），立即回传 ACK 放行下一批分片
+            if ($msg.ackReq -eq $true -and $receivedCount -lt $fileMeta.totalChunks) {
+                $ackChunk = '{"type":"chunk-ack","fileId":"' + $fileMeta.fileId + '","index":' + $msg.index + '}'
+                [void]$mqtt.PublishAsync($topicOut, $ackChunk).GetAwaiter().GetResult()
+            }
+
+            # 全部接收完成
+            if ($receivedCount -ge $fileMeta.totalChunks) {
+                Write-Progress -Activity "Receiving $($fileMeta.name)" -Completed
+                $fs.Close()
+                $fs = $null
+                Move-Item -Path $tempPath -Destination $finalPath -Force
+                Write-Host "[OK] Saved to Desktop: $finalPath" -ForegroundColor Green
+
+                # 通知发送端当前文件已完整落盘，可以发送下一个文件
+                $doneMsg = '{"type":"file-done","fileId":"' + $fileMeta.fileId + '"}'
+                [void]$mqtt.PublishAsync($topicOut, $doneMsg).GetAwaiter().GetResult()
+            }
         }
     }
+} finally {
+    if ($null -ne $fs) { $fs.Close() }
 }
